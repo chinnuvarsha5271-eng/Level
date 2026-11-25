@@ -13,6 +13,7 @@ Env:
 import os
 import sys
 import json
+import asyncio
 import time
 import hmac
 import hashlib
@@ -224,30 +225,151 @@ def grant_slots(username: str, n: int, hours: int = 0) -> Optional[int]:
         return u[username]["slots"]
 
 
+# ── REAL ENGINE (Garena OB55 protocol) ───────────────────────────────
+# Falls back to the demo ticker when the engine/ folder is not deployed.
+try:
+    import real_engine as REAL
+except Exception:  # pragma: no cover
+    REAL = None
+
 BOT_STATES = ["CONNECTING", "LOGGING_IN", "ONLINE", "MATCH_PLAYING", "COLLECTING_EXP"]
 TARGET_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 
 
-def _tick_account(a: Dict[str, Any]) -> Dict[str, Any]:
-    """Simulate a live bot: advance status, matches and EXP based on elapsed time."""
+_REAL_BUSY: set = set()          # uids with a Garena login in flight
+_NEED_RELOGIN: set = set()        # uids the UI asked to refresh
+_VERSION_SEEN: list = []          # last (release, client) from Garena
+_LOOP: Optional[Any] = None       # the aiohttp event loop, for background logins
+
+
+def _engine_live() -> bool:
+    """True when the real Garena engine is deployed and importable."""
+    try:
+        return bool(REAL and REAL.engine_available())
+    except Exception:
+        return False
+
+
+def _busy(uid: str) -> bool:
+    return str(uid) in _REAL_BUSY
+
+
+def _real_tick(a: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tick one account WITHOUT touching Garena: recompute derived fields from the
+    stored real profile. Actual Garena numbers only arrive from a real login.
+    """
+    now = int(time.time())
+    base_level = int(a.get("base_level") or 1)
+    base_exp = int(a.get("base_exp") or 0)
+    a.setdefault("live", False)
+    a["level"] = int(a.get("live_level") or base_level)
+    a["gained_exp"] = int(a.get("live_exp") or base_exp)
+    a["matches_played"] = int(a.get("matches_played") or 0)
+    a["exp_per_hour"] = 0                       # we never invent a rate
+    a["next_level_exp"] = 0
+    a["level_progress"] = 0.0
+    target = int(a.get("target_level") or 0)
+    a["target_level"] = target
+    if target:
+        span = max(1, target - base_level) if a.get("live") else int(a.get("base_level") or 1)
+        done = max(0, a["level"] - base_level)
+        a["target_pct"] = min(100, round(done / max(1, span) * 100, 1))
+    else:
+        a["target_pct"] = 0.0
+    started = int(a.get("bot_started") or a.get("added") or now)
+    a["uptime_min"] = max(0, now - started) // 60
+    if a.get("paused"):
+        a["status"] = "PAUSED"
+    elif _busy(a.get("uid")):
+        a["status"] = "LOGGING_IN"
+    elif a.get("live"):
+        a["status"] = "ONLINE"
+    else:
+        a["status"] = a.get("status") or "OFFLINE"
+    a["last_tick"] = now
+    return a
+
+
+async def real_login_uid(uid: str, password: str) -> Dict[str, Any]:
+    """Run a genuine Garena login and merge the result into accounts.json."""
+    if not _engine_live():
+        return {"ok": False, "error": "Real engine is not deployed on this server", "code": "no_engine"}
+    uid = str(uid)
+    _REAL_BUSY.add(uid)
+    try:
+        res = await REAL.real_login(uid, password)
+    except Exception as exc:
+        res = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "code": "exception"}
+    finally:
+        _REAL_BUSY.discard(uid)
+
+    with LOCK:
+        accs = accounts()
+        a = next((x for x in accs if str(x.get("uid")) == uid), None)
+        if a is None:
+            return res
+        now = int(time.time())
+        if res.get("ok"):
+            global _VERSION_SEEN
+            _VERSION_SEEN = [res.get("release_version"), res.get("client_version")]
+            a["live"] = True
+            a["demo"] = False
+            a["name"] = res.get("nickname") or a.get("name")
+            a["live_level"] = int(res.get("level") or 1)
+            a["live_exp"] = int(res.get("exp") or 0)
+            a["base_level"] = int(res.get("level") or 1)
+            a["base_exp"] = int(res.get("exp") or 0)
+            a["region"] = res.get("region") or a.get("region")
+            a["release_version"] = res.get("release_version")
+            a["client_version"] = res.get("client_version")
+            a["last_login"] = now
+            a["last_login_ok"] = True
+            a.pop("last_error", None)
+            a["status"] = "ONLINE"
+        else:
+            a["last_login"] = now
+            a["last_login_ok"] = False
+            a["last_error"] = res.get("error")
+            a["error_code"] = res.get("code")
+            if a.get("live"):
+                a["status"] = "ERROR"           # had real data before, now lost
+            else:
+                a["status"] = "OFFLINE"
+        _real_tick(a)
+        _write(ACCOUNTS_FILE, accs)
+    return res
+
+
+def schedule_login(uid: str, password: str) -> bool:
+    """Fire-and-forget a real login on the running loop."""
+    loop = _LOOP
+    if loop is None:
+        return False
+    try:
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(real_login_uid(uid, password)))
+        return True
+    except Exception:
+        return False
+
+
+def _demo_tick(a: Dict[str, Any]) -> Dict[str, Any]:
+    """Demo mode — used ONLY when the engine folder is absent. Clearly labelled."""
     now = int(time.time())
     started = int(a.get("bot_started") or a.get("added") or now)
     elapsed = max(0, now - started)
+    a["demo"] = True
+    a["live"] = False
     if a.get("paused"):
         a["status"] = "PAUSED"
         return a
-    # status cycles every ~18s through the bot lifecycle
     stage = (elapsed // 18) % len(BOT_STATES)
     a["status"] = BOT_STATES[stage]
-    # progress
     matches = int(elapsed // 45)
     gained = matches * 120 + int((elapsed % 45) * 2.6)
-    if a.get("last_seen_elapsed") is None:
-        a["last_seen_elapsed"] = elapsed
     base_exp = int(a.get("base_exp") or 0)
     a["gained_exp"] = base_exp + gained
     a["matches_played"] = int(a.get("base_matches") or 0) + matches
-    # level: 650 exp per level, starting at base level
     base_level = int(a.get("base_level") or 1)
     a["level"] = min(100, base_level + a["gained_exp"] // 650)
     a["next_level_exp"] = 650 - (a["gained_exp"] % 650)
@@ -262,6 +384,11 @@ def _tick_account(a: Dict[str, Any]) -> Dict[str, Any]:
     a["uptime_min"] = elapsed // 60
     a["last_tick"] = now
     return a
+
+
+def _tick_account(a: Dict[str, Any]) -> Dict[str, Any]:
+    """Dispatch to the real engine ticker, or the demo ticker when unavailable."""
+    return _real_tick(a) if _engine_live() else _demo_tick(a)
 
 
 def _save_accounts(accs: List[Dict[str, Any]]):
@@ -279,6 +406,14 @@ def refresh_players():
     return accs
 
 
+def _refresh_thread(uid: str, password: str):
+    """Blocking wrapper so Refresh works from a plain threading.Thread."""
+    try:
+        asyncio.run(real_login_uid(uid, password))
+    except Exception:
+        _REAL_BUSY.discard(str(uid))
+
+
 def bot_control(uid: str, action: str, payload: Dict[str, Any]):
     """refresh | restart | pause | resume | target — returns (ok, error)."""
     with LOCK:
@@ -289,6 +424,11 @@ def bot_control(uid: str, action: str, payload: Dict[str, Any]):
         now = int(time.time())
         if action == "refresh":
             _tick_account(a)
+            if _engine_live() and a.get("password"):
+                _REAL_BUSY.add(str(uid))          # show LOGGING_IN immediately
+                _save_accounts(accs)
+                threading.Thread(target=_refresh_thread, args=(uid, a["password"]), daemon=True).start()
+                return True, None
         elif action == "restart":
             # keep earned progress as the new baseline, restart the bot
             a["base_exp"] = int(a.get("gained_exp") or 0)
@@ -652,15 +792,25 @@ async def api_stats(request: web.Request):
             "level": int(a.get("level", 1) or 1), "gained_exp": int(a.get("gained_exp", 0) or 0),
             "matches_played": int(a.get("matches_played", 0) or 0),
             "status": a.get("status", "CONNECTING"), "region": a.get("region", "BD"),
-            "next_level_exp": int(a.get("next_level_exp") or 650),
+            "next_level_exp": int(a.get("next_level_exp") or 0),
             "level_progress": a.get("level_progress", 0),
-            "exp_per_hour": int(a.get("exp_per_hour") or 9600),
+            "exp_per_hour": int(a.get("exp_per_hour") or 0),
             "target_level": int(a.get("target_level") or 0),
             "target_pct": a.get("target_pct", 0),
             "uptime_min": int(a.get("uptime_min") or 0),
             "paused": bool(a.get("paused")),
             "restarts": int(a.get("restarts") or 0),
             "owner": a.get("owner"),
+            # ── REAL ENGINE FIELDS ──
+            "live": bool(a.get("live")),
+            "demo": bool(a.get("demo")) or not _engine_live(),
+            "logging_in": str(a.get("uid")) in _REAL_BUSY,
+            "last_login_ok": a.get("last_login_ok"),
+            "last_login": a.get("last_login"),
+            "last_error": a.get("last_error"),
+            "error_code": a.get("error_code"),
+            "release_version": a.get("release_version"),
+            "client_version": a.get("client_version"),
         })
     online = sum(1 for x in out if x["status"] in ("ONLINE", "MATCH_PLAYING", "COLLECTING_EXP"))
     return web.json_response({"status": "ok", "accounts": out,
@@ -668,7 +818,30 @@ async def api_stats(request: web.Request):
                               "total_gained_exp": sum(x["gained_exp"] for x in out),
                               "online": online,
                               "targets": TARGET_LEVELS,
-                              "role": me["role"]})
+                              "role": me["role"],
+                              "engine": {"real": _engine_live(),
+                                         "error": (REAL.engine_error() if REAL else "module missing"),
+                                         "version": (list(_VERSION_SEEN) if _VERSION_SEEN else None)}})
+
+
+async def api_engine_status(request: web.Request):
+    """GET /api/engine/status — is the real Garena engine deployed and reachable?"""
+    me = current(request)
+    if not me:
+        return web.json_response({"status": "error", "error": "unauthorized"}, status=401)
+    live = _engine_live()
+    info = {"real": live, "mode": "real" if live else "demo",
+            "error": (REAL.engine_error() if REAL else "real_engine module not found"),
+            "version": _VERSION_SEEN or None,
+            "busy": sorted(_REAL_BUSY)}
+    if live:
+        try:
+            ver = await asyncio.wait_for(REAL.live_version(), timeout=45)
+            info["garena"] = {"release_version": ver[0], "client_version": ver[1],
+                              "login_host": ver[2], "reachable": True}
+        except Exception as exc:
+            info["garena"] = {"reachable": False, "error": f"{type(exc).__name__}: {exc}"}
+    return web.json_response({"status": "ok", **info})
 
 
 async def api_account_add(request: web.Request):
@@ -707,9 +880,17 @@ async def api_account_add(request: web.Request):
                      "base_exp": 0, "base_matches": 0, "base_level": int(data.get("level") or 1),
                      "bot_started": now_ts, "paused": False,
                      "target_level": tgt, "restarts": 0,
+                     "live": False, "demo": not _engine_live(),
                      "added": now_ts})
         _write(ACCOUNTS_FILE, accs)
-    return web.json_response({"status": "ok", "uid": uid, "slots_left": left_of(me["username"])})
+
+    # real Garena login in the background — the card flips to ONLINE with real data
+    engine_up = _engine_live()
+    if engine_up:
+        schedule_login(uid, pwd)
+    return web.json_response({"status": "ok", "uid": uid, "engine": "real" if engine_up else "demo",
+                              "login_started": engine_up,
+                              "slots_left": left_of(me["username"])})
 
 
 async def api_bot_control(request: web.Request):
@@ -1178,6 +1359,25 @@ select.inp option{background:#0e1520;color:#e6eefc}
 @media(max-width:820px){.pc-grid{grid-template-columns:1fr 1fr}}
 @media(max-width:520px){.pc-grid{grid-template-columns:1fr 1fr;gap:9px}.pc-kv{padding:9px 10px}
   .pc-kv .v{font-size:17px}.pc-actions .btn.xs{flex:1}}
+
+/* ── real engine chips / banner ── */
+.pc-badges{margin:-6px 0 14px}
+.echip{display:inline-flex;align-items:center;gap:6px;font-size:9px;font-weight:950;letter-spacing:1.3px;
+  padding:5px 10px;border-radius:100px;border:1px solid}
+.echip.ok{color:#00f0a8;border-color:rgba(0,240,168,.35);background:rgba(0,240,168,.09)}
+.echip.demo{color:#ffb020;border-color:rgba(255,176,32,.35);background:rgba(255,176,32,.09)}
+.echip.wait{color:#5edcff;border-color:rgba(94,220,255,.35);background:rgba(94,220,255,.09)}
+.echip.bad{color:#ff5c6e;border-color:rgba(255,92,110,.35);background:rgba(255,92,110,.09)}
+.pc-err{margin:0 0 14px;padding:11px 13px;border-radius:11px;font-size:11.5px;line-height:1.55;
+  color:#ffb0b8;background:rgba(255,92,110,.08);border:1px solid rgba(255,92,110,.22)}
+.pc-err b{color:#ff5c6e;font-weight:900}
+.engbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 15px;border-radius:13px;
+  font-size:11.5px;border:1px solid}
+.engbar.ok{background:rgba(0,240,168,.07);border-color:rgba(0,240,168,.22)}
+.engbar.bad{background:rgba(255,176,32,.07);border-color:rgba(255,176,32,.22)}
+.engbar b{font-weight:900;letter-spacing:.2px}
+.engbar .esub{color:var(--mut);font-size:11px}
+@media(max-width:520px){.engbar{font-size:10.5px}.engbar .esub{display:block;width:100%}}
 </style>
 </head>
 <body>
@@ -1328,7 +1528,8 @@ select.inp option{background:#0e1520;color:#e6eefc}
     <div class="glass hero" style="margin-bottom:18px">
       <div class="badge24">LIVE PLAYERS</div>
       <h2>My <em>players</em></h2>
-      <p>Live bot status, EXP progress and targets. Updates automatically every few seconds.</p>
+      <p>Real Garena login — level and EXP are read from the account itself, never invented.</p>
+      <div id="engBanner" style="margin-top:14px"></div>
       <div class="row" style="margin-top:16px">
         <button class="btn pri" id="refreshAll" onclick="botAll('refresh')">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M20 11a8 8 0 1 0-2.3 6.3"/><path d="M20 4.5V11h-6.5"/></svg> Refresh All</button>
@@ -1686,38 +1887,56 @@ function stMeta(st){
   if(s.indexOf('ERROR')>=0||s.indexOf('FAIL')>=0) return {cls:'p-bad', dot:'#ff5c6e', label:'ERROR'};
   return {cls:'p-off', dot:'#7d8ea6', label:s||'OFFLINE'};
 }
+function ago(ts){
+  if(!ts) return 'never';
+  const d = Math.floor(Date.now()/1000) - Number(ts);
+  if(d < 60) return d+'s ago';
+  if(d < 3600) return Math.floor(d/60)+'m ago';
+  if(d < 86400) return Math.floor(d/3600)+'h ago';
+  return Math.floor(d/86400)+'d ago';
+}
 function playerCard(a){
   const nm = a.nickname || ('Player_'+(a.uid||'').slice(0,6));
-  const m = stMeta(a.status);
-  const prog = Math.max(0, Math.min(100, Number(a.level_progress||0)));
+  const m = stMeta(a.logging_in ? 'LOGGING_IN' : a.status);
   const tgt = Number(a.target_level||0);
   const tpct = Math.max(0, Math.min(100, Number(a.target_pct||0)));
-  const paused = !!a.paused;
+  const live = !!a.live;
+  const demo = !!a.demo && !live;
+  const err  = a.last_error && !a.logging_in ? String(a.last_error) : '';
+  const ver  = a.release_version ? (a.release_version+' '+a.client_version) : '';
+
+  let badge = '';
+  if(live)        badge = '<span class="echip ok">LIVE · GARENA</span>';
+  else if(demo)   badge = '<span class="echip demo">DEMO MODE</span>';
+  else if(a.logging_in) badge = '<span class="echip wait">CONNECTING TO GARENA…</span>';
+  else            badge = '<span class="echip bad">NOT CONNECTED</span>';
+
   return '<div class="pcard" data-uid="'+esc(a.uid)+'">'
     + '<div class="pc-top">'
     +   '<div class="pav big">'+esc(ini(nm))+'</div>'
     +   '<div class="pc-id"><div class="pnm lg">'+esc(nm)+'</div>'
-    +     '<div class="pid">UID '+esc(a.uid||'-')+'</div></div>'
+    +     '<div class="pid">UID '+esc(a.uid||'-')+(ver?(' · '+esc(ver)):'')+'</div></div>'
     +   '<div class="pstat"><span class="sdot" style="background:'+m.dot+';box-shadow:0 0 10px '+m.dot+'"></span>'
     +     '<span class="pill '+m.cls+'">'+m.label+'</span></div>'
     + '</div>'
+    + '<div class="pc-badges">'+badge+'</div>'
     + '<div class="pc-grid">'
-    +   '<div class="pc-kv"><div class="k">LEVEL</div><div class="v">'+(a.level||1)+'</div>'
-    +     '<div class="mini"><i style="width:'+prog+'%"></i></div>'
-    +     '<div class="sub">'+nf(a.next_level_exp)+' EXP to next</div></div>'
-    +   '<div class="pc-kv"><div class="k">EXP GAINED</div><div class="v g">+'+nf(a.gained_exp)+'</div>'
-    +     '<div class="sub">'+nf(a.exp_per_hour||0)+'/hour</div></div>'
-    +   '<div class="pc-kv"><div class="k">MATCHES</div><div class="v">'+nf(a.matches_played)+'</div>'
-    +     '<div class="sub">'+(a.uptime_min||0)+' min uptime</div></div>'
+    +   '<div class="pc-kv"><div class="k">LEVEL</div><div class="v">'+(live?(a.level||1):'—')+'</div>'
+    +     '<div class="sub">'+(live?'real account level':'waiting for login')+'</div></div>'
+    +   '<div class="pc-kv"><div class="k">TOTAL EXP</div><div class="v g">'+(live?nf(a.gained_exp):'—')+'</div>'
+    +     '<div class="sub">'+(live?'read from Garena':'not fetched yet')+'</div></div>'
+    +   '<div class="pc-kv"><div class="k">LAST LOGIN</div><div class="v" style="font-size:15px">'+(live?ago(a.last_login):'—')+'</div>'
+    +     '<div class="sub">'+(a.last_login_ok===false?'login failed':(live?'verified':'—'))+'</div></div>'
     +   '<div class="pc-kv"><div class="k">TARGET</div><div class="v">'+(tgt?('Lv '+tgt):'—')+'</div>'
     +     (tgt ? '<div class="mini"><i style="width:'+tpct+'%;background:linear-gradient(90deg,#a06cff,#5edcff)"></i></div><div class="sub">'+tpct+'% reached</div>'
              : '<div class="sub">not set</div>')+'</div>'
     + '</div>'
+    + (err ? '<div class="pc-err"><b>Login failed.</b> '+esc(err)+'</div>' : '')
     + '<div class="pc-actions">'
-    +   '<button class="btn xs" onclick="bot(\''+esc(a.uid)+'\',\'refresh\')">Refresh</button>'
-    +   '<button class="btn xs" onclick="bot(\''+esc(a.uid)+'\',\'restart\')">Restart</button>'
-    +   '<button class="btn xs" onclick="bot(\''+esc(a.uid)+'\',\''+(paused?'resume':'pause')+'\')">'+(paused?'Resume':'Pause')+'</button>'
+    +   '<button class="btn xs" onclick="bot(\''+esc(a.uid)+'\',\'refresh\')">'+(live?'Re-login':'Retry login')+'</button>'
     +   '<button class="btn xs" onclick="setTarget(\''+esc(a.uid)+'\','+(tgt||0)+')">Set Target</button>'
+    +   (demo ? '<button class="btn xs" onclick="bot(\''+esc(a.uid)+'\',\'restart\')">Restart</button>'
+             + '<button class="btn xs" onclick="bot(\''+esc(a.uid)+'\',\''+((a.paused)?'resume':'pause')+'\')">'+((a.paused)?'Resume':'Pause')+'</button>' : '')
     +   '<button class="btn dan xs" onclick="delId(\''+esc(a.uid)+'\')">Delete</button>'
     + '</div></div>';
 }
@@ -1726,7 +1945,7 @@ async function bot(uid, action, extra){
   try{
     const d = await api('/api/account/bot', body);
     const a = d.account || {};
-    toast(action==='refresh' ? ('Refreshed — '+(a.status||'')+(a.level?(' · Lv '+a.level):''))
+    toast(action==='refresh' ? (a.live ? ('Live profile — Lv '+a.level+' · '+nf(a.gained_exp)+' EXP') : (a.logging_in ? 'Contacting Garena…' : 'Login failed — see the card'))
         : action==='restart' ? 'Bot restarted'
         : action==='pause' ? 'Bot paused'
         : action==='resume' ? 'Bot resumed'
@@ -1765,14 +1984,25 @@ async function loadStats(){
   let d;
   try{ d = await api('/api/stats'); }catch(e){ if(e.message==='login') showAuth(); return; }
   const accs = d.accounts || [];
-  const on = accs.filter(a=>{const s=String(a.status||'').toUpperCase();return s==='ONLINE'||s.includes('MATCH')||s==='PLAYING'}).length;
+  window.__ENGINE = d.engine || {real:false};
+  const eb = $('engBanner');
+  if(eb){
+    const e = d.engine || {};
+    const g = e.version && e.version[0] ? (' · Garena '+e.version[0]+' '+e.version[1]) : '';
+    eb.innerHTML = e.real
+      ? '<div class="engbar ok"><span class="sdot" style="background:#00f0a8;box-shadow:0 0 10px #00f0a8"></span>'
+        + '<b>Real engine connected</b><span class="esub">Live Garena protocol'+esc(g)+' — profile data comes from the account, not a simulation.</span></div>'
+      : '<div class="engbar bad"><span class="sdot" style="background:#ffb020;box-shadow:0 0 10px #ffb020"></span>'
+        + '<b>Demo mode</b><span class="esub">The Garena engine is not deployed on this server, so numbers below are simulated, not real.</span></div>';
+  }
+  const on = accs.filter(a=>a.live).length;
   $('stIds').textContent = nf(accs.length);
   $('stOnline').textContent = nf(on);
   $('stExp').textContent = nf(d.total_gained_exp);
   $('idsTabCnt').textContent = accs.length;
   $('idsCount').textContent = accs.length;
   $('idsSlots').textContent = accs.length;
-  $('accHint').textContent = accs.length ? (on+' online · '+accs.length+' total') : '';
+  $('accHint').textContent = accs.length ? (on+' live · '+accs.length+' total') : '';
   const maxSlots = (ME && ME.slots) || Math.max(accs.length,1);
   $('barIds').style.width = Math.min(100, Math.round(accs.length/Math.max(1,maxSlots)*100))+'%';
   $('barOn').style.width = accs.length ? Math.round(on/accs.length*100)+'%' : '0%';
@@ -1978,13 +2208,26 @@ def make_app() -> web.Application:
     app.router.add_post("/api/panel/admin/user", api_admin_user)
     app.router.add_post("/api/panel/admin/order", api_admin_order)
     app.router.add_get("/api/stats", api_stats)
+    app.router.add_get("/api/engine/status", api_engine_status)
     app.router.add_post("/api/account/add", api_account_add)
     app.router.add_post("/api/account/bot", api_bot_control)
     app.router.add_post("/api/account/delete", api_account_delete)
     return app
 
 
+async def _on_startup(app: web.Application):
+    """Grab the running loop so background Garena logins can be scheduled."""
+    global _LOOP
+    _LOOP = asyncio.get_running_loop()
+    mode = "REAL (Garena OB55)" if _engine_live() else "DEMO (engine folder missing)"
+    print(f"[ENGINE] mode = {mode}")
+    if REAL is not None and REAL.engine_error():
+        print(f"[ENGINE] import error: {REAL.engine_error()}")
+
+
 if __name__ == "__main__":
     print(f"CHINNU LEVEL PRO → http://{HOST}:{PORT}")
     print(f"data dir: {BASE_DIR}")
-    web.run_app(make_app(), host=HOST, port=PORT, access_log=None)
+    _app = make_app()
+    _app.on_startup.append(_on_startup)
+    web.run_app(_app, host=HOST, port=PORT, access_log=None)
