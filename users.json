@@ -1,15 +1,24 @@
 {
   "users": {
-    "john": {
-      "username": "john",
-      "salt": "0869327a7ac489ea",
-      "password_hash": "cdb424fa8d3519f82b9ff1aa5bf7189207c6ed05af907b496680fa2760069597",
-      "slots": 10,
+    "gamer": {
+      "username": "gamer",
+      "salt": "866adaf300f42d6d",
+      "password_hash": "4695c3387224564b4d2ed00c5c272dca3f2935017a19388d8cba2c984d478552",
+      "slots": 5,
       "telegram": "",
-      "created": 1795596437,
+      "created": 1795597508,
       "is_admin": false,
-      "expires_at": 1795682843,
-      "updated": 1795596443
+      "expires_at": 1795683908,
+      "updated": 1795597508
+    },
+    "rival": {
+      "username": "rival",
+      "salt": "646842b6f59ab522",
+      "password_hash": "ed57e72075a2723515f3cf5431badeae9886a1fb3c475aecf1cf36b3bec6c115",
+      "slots": 0,
+      "telegram": "",
+      "created": 1795597514,
+      "is_admin": false
     }
   }
 }

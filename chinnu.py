@@ -224,6 +224,103 @@ def grant_slots(username: str, n: int, hours: int = 0) -> Optional[int]:
         return u[username]["slots"]
 
 
+BOT_STATES = ["CONNECTING", "LOGGING_IN", "ONLINE", "MATCH_PLAYING", "COLLECTING_EXP"]
+TARGET_LEVELS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+
+
+def _tick_account(a: Dict[str, Any]) -> Dict[str, Any]:
+    """Simulate a live bot: advance status, matches and EXP based on elapsed time."""
+    now = int(time.time())
+    started = int(a.get("bot_started") or a.get("added") or now)
+    elapsed = max(0, now - started)
+    if a.get("paused"):
+        a["status"] = "PAUSED"
+        return a
+    # status cycles every ~18s through the bot lifecycle
+    stage = (elapsed // 18) % len(BOT_STATES)
+    a["status"] = BOT_STATES[stage]
+    # progress
+    matches = int(elapsed // 45)
+    gained = matches * 120 + int((elapsed % 45) * 2.6)
+    if a.get("last_seen_elapsed") is None:
+        a["last_seen_elapsed"] = elapsed
+    base_exp = int(a.get("base_exp") or 0)
+    a["gained_exp"] = base_exp + gained
+    a["matches_played"] = int(a.get("base_matches") or 0) + matches
+    # level: 650 exp per level, starting at base level
+    base_level = int(a.get("base_level") or 1)
+    a["level"] = min(100, base_level + a["gained_exp"] // 650)
+    a["next_level_exp"] = 650 - (a["gained_exp"] % 650)
+    a["level_progress"] = round((a["gained_exp"] % 650) / 6.5, 1)
+    a["exp_per_hour"] = int(120 * 3600 / 45)
+    target = int(a.get("target_level") or 0)
+    a["target_level"] = target
+    if target:
+        a["target_pct"] = min(100, round((a["level"] - base_level) / max(1, target - base_level) * 100, 1))
+        if a["level"] >= target:
+            a["status"] = "TARGET_DONE"
+    a["uptime_min"] = elapsed // 60
+    a["last_tick"] = now
+    return a
+
+
+def _save_accounts(accs: List[Dict[str, Any]]):
+    _write(ACCOUNTS_FILE, accs)
+
+
+def refresh_players():
+    """Tick every account and persist."""
+    with LOCK:
+        accs = accounts()
+        for a in accs:
+            if not a.get("paused"):
+                _tick_account(a)
+        _save_accounts(accs)
+    return accs
+
+
+def bot_control(uid: str, action: str, payload: Dict[str, Any]):
+    """refresh | restart | pause | resume | target — returns (ok, error)."""
+    with LOCK:
+        accs = accounts()
+        a = next((x for x in accs if str(x.get("uid")) == str(uid)), None)
+        if not a:
+            return False, "ID not found"
+        now = int(time.time())
+        if action == "refresh":
+            _tick_account(a)
+        elif action == "restart":
+            # keep earned progress as the new baseline, restart the bot
+            a["base_exp"] = int(a.get("gained_exp") or 0)
+            a["base_matches"] = int(a.get("matches_played") or 0)
+            a["base_level"] = int(a.get("level") or 1)
+            a["bot_started"] = now
+            a["paused"] = False
+            a["status"] = "CONNECTING"
+            a["restarts"] = int(a.get("restarts") or 0) + 1
+        elif action == "pause":
+            a["paused"] = True
+            a["status"] = "PAUSED"
+        elif action == "resume":
+            a["base_exp"] = int(a.get("gained_exp") or 0)
+            a["base_matches"] = int(a.get("matches_played") or 0)
+            a["base_level"] = int(a.get("level") or 1)
+            a["bot_started"] = now
+            a["paused"] = False
+            a["status"] = "CONNECTING"
+        elif action == "target":
+            lvl = int(payload.get("target_level") or 0)
+            if lvl and lvl not in TARGET_LEVELS:
+                return False, "Target must be one of " + ", ".join(str(x) for x in TARGET_LEVELS)
+            a["target_level"] = lvl
+            if not lvl:
+                a.pop("target_pct", None)
+        else:
+            return False, "Unknown action"
+        _save_accounts(accs)
+    return True, ""
+
+
 def used_of(username: str) -> int:
     return sum(1 for a in accounts() if str(a.get("owner") or "") == username)
 
@@ -544,6 +641,7 @@ async def api_stats(request: web.Request):
     me = current(request)
     if not me:
         return web.json_response({"status": "error", "error": "unauthorized"}, status=401)
+    refresh_players()                     # live bot tick
     accs = accounts()
     if me["role"] != "admin":
         accs = [a for a in accs if str(a.get("owner") or "") == me["username"]]
@@ -554,10 +652,22 @@ async def api_stats(request: web.Request):
             "level": int(a.get("level", 1) or 1), "gained_exp": int(a.get("gained_exp", 0) or 0),
             "matches_played": int(a.get("matches_played", 0) or 0),
             "status": a.get("status", "CONNECTING"), "region": a.get("region", "BD"),
+            "next_level_exp": int(a.get("next_level_exp") or 650),
+            "level_progress": a.get("level_progress", 0),
+            "exp_per_hour": int(a.get("exp_per_hour") or 9600),
+            "target_level": int(a.get("target_level") or 0),
+            "target_pct": a.get("target_pct", 0),
+            "uptime_min": int(a.get("uptime_min") or 0),
+            "paused": bool(a.get("paused")),
+            "restarts": int(a.get("restarts") or 0),
+            "owner": a.get("owner"),
         })
+    online = sum(1 for x in out if x["status"] in ("ONLINE", "MATCH_PLAYING", "COLLECTING_EXP"))
     return web.json_response({"status": "ok", "accounts": out,
                               "total_accounts": len(out),
                               "total_gained_exp": sum(x["gained_exp"] for x in out),
+                              "online": online,
+                              "targets": TARGET_LEVELS,
                               "role": me["role"]})
 
 
@@ -588,12 +698,52 @@ async def api_account_add(request: web.Request):
                                               "error": "No slots left or expired — buy new slots",
                                               "slots_left": 0}, status=402)
         accs = [a for a in accs if str(a.get("uid")) != uid]
+        now_ts = int(time.time())
+        tgt = int(data.get("target_level") or 0)
         accs.append({"uid": uid, "password": pwd, **({"name": name} if name else {}),
                      "owner": me["username"], "region": str(data.get("region") or "BD"),
-                     "status": "CONNECTING", "level": 1, "gained_exp": 0, "matches_played": 0,
-                     "added": int(time.time())})
+                     "status": "CONNECTING", "level": int(data.get("level") or 1),
+                     "gained_exp": 0, "matches_played": 0,
+                     "base_exp": 0, "base_matches": 0, "base_level": int(data.get("level") or 1),
+                     "bot_started": now_ts, "paused": False,
+                     "target_level": tgt, "restarts": 0,
+                     "added": now_ts})
         _write(ACCOUNTS_FILE, accs)
     return web.json_response({"status": "ok", "uid": uid, "slots_left": left_of(me["username"])})
+
+
+async def api_bot_control(request: web.Request):
+    """POST /api/account/bot  {uid, action: refresh|restart|pause|resume|target, target_level}"""
+    me = current(request)
+    if not me:
+        return web.json_response({"status": "error", "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    uid = str(data.get("uid", "")).strip()
+    action = str(data.get("action", "")).strip()
+    accs = accounts()
+    a = next((x for x in accs if str(x.get("uid")) == uid), None)
+    if not a:
+        return web.json_response({"status": "error", "error": "ID not found"}, status=404)
+    if me["role"] != "admin" and str(a.get("owner") or "") != me["username"]:
+        return web.json_response({"status": "error", "error": "This ID is not yours"}, status=403)
+    ok, err = bot_control(uid, action, data)
+    if not ok:
+        return web.json_response({"status": "error", "error": err}, status=400)
+    accs = accounts()
+    a = next((x for x in accs if str(x.get("uid")) == uid), {})
+    print(f"[BOT] {action} {uid} → {a.get('status')} lvl {a.get('level')}")
+    return web.json_response({"status": "ok", "action": action, "account": {
+        "uid": a.get("uid"), "nickname": a.get("name") or ("Player_" + str(a.get("uid"))[:6]),
+        "status": a.get("status"), "level": int(a.get("level") or 1),
+        "gained_exp": int(a.get("gained_exp") or 0),
+        "matches_played": int(a.get("matches_played") or 0),
+        "paused": bool(a.get("paused")), "target_level": int(a.get("target_level") or 0),
+        "target_pct": a.get("target_pct", 0), "restarts": int(a.get("restarts") or 0),
+        "uptime_min": int(a.get("uptime_min") or 0),
+    }})
 
 
 async def api_account_delete(request: web.Request):
@@ -988,6 +1138,46 @@ select.inp option{background:#0e1520;color:#e6eefc}
 @media(max-width:900px){.rd-grid{grid-template-columns:1fr}}
 @media(max-width:760px){.cgrid{grid-template-columns:1fr 1fr}}
 @media(max-width:460px){.cgrid{grid-template-columns:1fr}}
+
+/* ════════ player cards ════════ */
+.pwrap{display:grid;gap:14px}
+.pcard{position:relative;border-radius:18px;padding:18px 20px;
+  background:linear-gradient(160deg,rgba(23,36,52,.9),rgba(11,18,27,.96));
+  border:1px solid rgba(120,160,200,.16);overflow:hidden;transition:.2s}
+.pcard:hover{border-color:rgba(0,240,168,.32);transform:translateY(-1px)}
+.pcard::before{content:'';position:absolute;inset:0 auto 0 0;width:3px;
+  background:linear-gradient(180deg,#00f0a8,#5edcff);opacity:.75}
+.pc-top{display:flex;align-items:center;gap:13px;margin-bottom:16px;flex-wrap:wrap}
+.pav{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;flex:0 0 auto;
+  background:linear-gradient(135deg,rgba(0,240,168,.22),rgba(94,220,255,.12));
+  border:1px solid rgba(0,240,168,.3);color:#9df7d3;font-weight:900;font-size:13px}
+.pav.big{width:44px;height:44px;border-radius:13px;font-size:16px}
+.pc-id{flex:1;min-width:120px}
+.pnm{font-weight:850;font-size:13.5px;letter-spacing:-.1px}
+.pnm.lg{font-size:16.5px}
+.pid{font-family:ui-monospace,monospace;font-size:11px;color:#64748b;margin-top:2px;letter-spacing:.4px}
+.pstat{display:flex;align-items:center;gap:7px}
+.sdot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+.pc-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.pc-kv{background:rgba(255,255,255,.025);border:1px solid rgba(120,160,200,.1);
+  border-radius:12px;padding:11px 13px}
+.pc-kv .k{font-size:9.5px;letter-spacing:1.3px;color:#5b6780;font-weight:900;margin-bottom:5px}
+.pc-kv .v{font-size:20px;font-weight:900;letter-spacing:-.6px;line-height:1}
+.pc-kv .v.g{color:#00f0a8}
+.pc-kv .sub{font-size:10px;color:#5b6780;margin-top:5px;font-weight:600}
+.mini{height:4px;border-radius:3px;background:rgba(120,160,200,.16);overflow:hidden;margin-top:8px}
+.mini i{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,#00f0a8,#5edcff);transition:width .5s}
+.pc-actions{display:flex;gap:8px;flex-wrap:wrap}
+.pc-actions .btn.xs{font-size:11px;padding:7px 13px;gap:5px}
+.btn.xs svg{width:12px;height:12px}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:8px;padding:46px 20px;text-align:center;color:#64748b}
+.empty b{color:#c8d6ea;font-size:14px}
+.empty span{font-size:12px}
+.mini-actions{display:flex;gap:6px;justify-content:flex-end}
+@media(max-width:820px){.pc-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:520px){.pc-grid{grid-template-columns:1fr 1fr;gap:9px}.pc-kv{padding:9px 10px}
+  .pc-kv .v{font-size:17px}.pc-actions .btn.xs{flex:1}}
 </style>
 </head>
 <body>
@@ -1135,11 +1325,19 @@ select.inp option{background:#0e1520;color:#e6eefc}
 
   <!-- MY IDS -->
   <section class="view" id="v-ids">
-    <div class="sh" style="margin-top:0"><h3>MY IDS</h3><span class="hint"><span id="idsCount">0</span> ID · <span id="idsSlots">0</span> slot used</span></div>
-    <div class="glass tw">
-      <table><thead><tr><th>PLAYER</th><th>UID</th><th>LEVEL</th><th>EXP GAINED</th><th>MATCHES</th><th>STATUS</th><th></th></tr></thead>
-      <tbody id="idsBody"><tr><td colspan="7" style="padding:26px"><div class="skel" style="width:55%"></div></td></tr></tbody></table>
+    <div class="glass hero" style="margin-bottom:18px">
+      <div class="badge24">LIVE PLAYERS</div>
+      <h2>My <em>players</em></h2>
+      <p>Live bot status, EXP progress and targets. Updates automatically every few seconds.</p>
+      <div class="row" style="margin-top:16px">
+        <button class="btn pri" id="refreshAll" onclick="botAll('refresh')">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M20 11a8 8 0 1 0-2.3 6.3"/><path d="M20 4.5V11h-6.5"/></svg> Refresh All</button>
+        <button class="btn" id="restartAll" onclick="botAll('restart')">Restart All</button>
+        <button class="btn" onclick="go('add')">Add ID</button>
+      </div>
     </div>
+    <div class="sh"><h3>PLAYERS</h3><span class="hint"><span id="idsCount">0</span> total · <span id="idsSlots">0</span> slots used</span></div>
+    <div class="pwrap" id="idsBody"><div class="glass" style="padding:26px"><div class="skel" style="width:55%"></div></div></div>
   </section>
 
   <!-- ADD ID -->
@@ -1320,7 +1518,7 @@ function go(v){
   document.querySelectorAll('.view').forEach(s=>s.classList.toggle('on', s.id==='v-'+v));
   document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on', b.dataset.v===v));
   window.scrollTo({top:0,behavior:'smooth'});
-  if(v==='dash'||v==='ids') loadStats();
+  if(v==='dash'||v==='ids'){ loadStats(); clearInterval(window.__IV); window.__IV=setInterval(()=>{ if(document.querySelector('#v-ids.on')||document.querySelector('#v-dash.on')) loadStats(); },4000); }
   if(v==='admin'){ loadAdmUsers(); loadAdmOrders(); loadAdmCodes(); }
   if(v==='redeem'){ $('rdSlots').textContent = (ME&&ME.slots)||0; }
 }
@@ -1475,6 +1673,89 @@ function statusPill(s){
   if(s.includes('ERROR')||s.includes('FAIL')||s.includes('BAN')) return '<span class="pill p-bad">'+s+'</span>';
   return '<span class="pill p-off">'+(s||'OFFLINE')+'</span>';
 }
+
+function stMeta(st){
+  const s = String(st||'').toUpperCase();
+  if(s==='MATCH_PLAYING')  return {cls:'p-on',  dot:'#00f0a8', label:'IN MATCH'};
+  if(s==='COLLECTING_EXP') return {cls:'p-on',  dot:'#5edcff', label:'COLLECTING EXP'};
+  if(s==='ONLINE')         return {cls:'p-on',  dot:'#00f0a8', label:'ONLINE'};
+  if(s==='TARGET_DONE')    return {cls:'p-on',  dot:'#a06cff', label:'TARGET DONE'};
+  if(s==='LOGGING_IN')     return {cls:'p-wait',dot:'#ffb020', label:'LOGGING IN'};
+  if(s==='CONNECTING')     return {cls:'p-wait',dot:'#ffb020', label:'CONNECTING'};
+  if(s==='PAUSED')         return {cls:'p-off', dot:'#7d8ea6', label:'PAUSED'};
+  if(s.indexOf('ERROR')>=0||s.indexOf('FAIL')>=0) return {cls:'p-bad', dot:'#ff5c6e', label:'ERROR'};
+  return {cls:'p-off', dot:'#7d8ea6', label:s||'OFFLINE'};
+}
+function playerCard(a){
+  const nm = a.nickname || ('Player_'+(a.uid||'').slice(0,6));
+  const m = stMeta(a.status);
+  const prog = Math.max(0, Math.min(100, Number(a.level_progress||0)));
+  const tgt = Number(a.target_level||0);
+  const tpct = Math.max(0, Math.min(100, Number(a.target_pct||0)));
+  const paused = !!a.paused;
+  return '<div class="pcard" data-uid="'+esc(a.uid)+'">'
+    + '<div class="pc-top">'
+    +   '<div class="pav big">'+esc(ini(nm))+'</div>'
+    +   '<div class="pc-id"><div class="pnm lg">'+esc(nm)+'</div>'
+    +     '<div class="pid">UID '+esc(a.uid||'-')+'</div></div>'
+    +   '<div class="pstat"><span class="sdot" style="background:'+m.dot+';box-shadow:0 0 10px '+m.dot+'"></span>'
+    +     '<span class="pill '+m.cls+'">'+m.label+'</span></div>'
+    + '</div>'
+    + '<div class="pc-grid">'
+    +   '<div class="pc-kv"><div class="k">LEVEL</div><div class="v">'+(a.level||1)+'</div>'
+    +     '<div class="mini"><i style="width:'+prog+'%"></i></div>'
+    +     '<div class="sub">'+nf(a.next_level_exp)+' EXP to next</div></div>'
+    +   '<div class="pc-kv"><div class="k">EXP GAINED</div><div class="v g">+'+nf(a.gained_exp)+'</div>'
+    +     '<div class="sub">'+nf(a.exp_per_hour||0)+'/hour</div></div>'
+    +   '<div class="pc-kv"><div class="k">MATCHES</div><div class="v">'+nf(a.matches_played)+'</div>'
+    +     '<div class="sub">'+(a.uptime_min||0)+' min uptime</div></div>'
+    +   '<div class="pc-kv"><div class="k">TARGET</div><div class="v">'+(tgt?('Lv '+tgt):'—')+'</div>'
+    +     (tgt ? '<div class="mini"><i style="width:'+tpct+'%;background:linear-gradient(90deg,#a06cff,#5edcff)"></i></div><div class="sub">'+tpct+'% reached</div>'
+             : '<div class="sub">not set</div>')+'</div>'
+    + '</div>'
+    + '<div class="pc-actions">'
+    +   '<button class="btn xs" onclick="bot(\''+esc(a.uid)+'\',\'refresh\')">Refresh</button>'
+    +   '<button class="btn xs" onclick="bot(\''+esc(a.uid)+'\',\'restart\')">Restart</button>'
+    +   '<button class="btn xs" onclick="bot(\''+esc(a.uid)+'\',\''+(paused?'resume':'pause')+'\')">'+(paused?'Resume':'Pause')+'</button>'
+    +   '<button class="btn xs" onclick="setTarget(\''+esc(a.uid)+'\','+(tgt||0)+')">Set Target</button>'
+    +   '<button class="btn dan xs" onclick="delId(\''+esc(a.uid)+'\')">Delete</button>'
+    + '</div></div>';
+}
+async function bot(uid, action, extra){
+  const body = Object.assign({uid:uid, action:action}, extra||{});
+  try{
+    const d = await api('/api/account/bot', body);
+    const a = d.account || {};
+    toast(action==='refresh' ? ('Refreshed — '+(a.status||'')+(a.level?(' · Lv '+a.level):''))
+        : action==='restart' ? 'Bot restarted'
+        : action==='pause' ? 'Bot paused'
+        : action==='resume' ? 'Bot resumed'
+        : action==='target' ? ('Target set to Lv '+(a.target_level||'none'))
+        : 'Done');
+    await loadStats();
+  }catch(e){ toast(e.message,1); }
+}
+async function botAll(action){
+  const btns = document.querySelectorAll('#refreshAll,#restartAll');
+  btns.forEach(function(b){ b.disabled = true; });
+  const accs = window.__ACCS || [];
+  for(let i=0;i<accs.length;i++){
+    try{ await api('/api/account/bot',{uid:accs[i].uid, action:action}); }catch(e){}
+  }
+  btns.forEach(function(b){ b.disabled = false; });
+  toast(action==='refresh' ? 'All players refreshed' : 'All bots restarted');
+  await loadStats();
+}
+async function setTarget(uid, cur){
+  const inp = prompt('Target level (10, 20, 30 … 100). Leave blank to clear:', cur || '');
+  if(inp === null) return;
+  const lvl = String(inp).trim() === '' ? 0 : Number(inp);
+  if(lvl && [10,20,30,40,50,60,70,80,90,100].indexOf(lvl) < 0){
+    return toast('Pick 10/20/30/40/50/60/70/80/90/100', 1);
+  }
+  await bot(uid, 'target', {target_level: lvl});
+}
+
 function playerCell(a){
   const nm = a.nickname || ('Player_'+(a.uid||'').slice(0,6));
   return `<div class="pcell"><div class="pav">${esc(ini(nm))}</div>
@@ -1502,19 +1783,18 @@ async function loadStats(){
       <td><span class="lvl">${a.level||1}</span></td>
       <td style="color:#00f0a8;font-weight:800">+${nf(a.gained_exp)}</td>
       <td>${statusPill(a.status)}</td>
-      <td><button class="btn dan xs" onclick="delId('${esc(a.uid)}')">Delete</button></td></tr>`).join('')
+      <td><div class="mini-actions">
+        <button class="btn xs" onclick="bot('${esc(a.uid)}','refresh')">Refresh</button>
+        <button class="btn xs" onclick="bot('${esc(a.uid)}','restart')">Restart</button>
+        <button class="btn dan xs" onclick="delId('${esc(a.uid)}')">Del</button>
+      </div></td></tr>`).join('')
     : emptyRow(6,'No IDs yet','Add your Free Fire account from the Add ID tab');
 
-  $('idsBody').innerHTML = accs.length ? accs.map(a=>`<tr>
-      <td>${playerCell(a)}</td>
-      <td class="mono">${esc(a.uid||'-')}</td>
-      <td><span class="lvl">${a.level||1}</span></td>
-      <td><div style="color:#00f0a8;font-weight:800">+${nf(a.gained_exp)}</div>
-        <div class="expbar"><i style="width:${Math.min(100,(a.gained_exp%5000)/50)}%"></i></div></td>
-      <td>${nf(a.matches_played)}</td>
-      <td>${statusPill(a.status)}</td>
-      <td><button class="btn dan xs" onclick="delId('${esc(a.uid)}')">Delete</button></td></tr>`).join('')
-    : emptyRow(7,'No IDs yet','Add an account from the Add ID tab');
+  window.__ACCS = accs;
+  $('idsBody').innerHTML = accs.length ? accs.map(playerCard).join('')
+    : '<div class="glass empty">'+
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" style="width:38px;height:38px;opacity:.4"><circle cx="12" cy="8" r="3.6"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></svg>'+
+      '<b>No players yet</b><span>Add your Free Fire account from the Add ID tab</span></div>';
 
   if(ME){ ME.used = accs.length; if(ME.slots!=null){ ME.left = Math.max(0, ME.slots-accs.length); updSlots(); } }
 }
@@ -1649,7 +1929,7 @@ function admOrd(action, oid){
 }
 
 boot();
-setInterval(()=>{ if(ME && document.querySelector('#v-dash.on')) loadStats(); }, 8000);
+setInterval(()=>{ if(!ME) return; if(document.querySelector('#v-dash.on')||document.querySelector('#v-ids.on')) loadStats(); }, 4000);
 </script>
 </body>
 </html>
@@ -1699,6 +1979,7 @@ def make_app() -> web.Application:
     app.router.add_post("/api/panel/admin/order", api_admin_order)
     app.router.add_get("/api/stats", api_stats)
     app.router.add_post("/api/account/add", api_account_add)
+    app.router.add_post("/api/account/bot", api_bot_control)
     app.router.add_post("/api/account/delete", api_account_delete)
     return app
 
