@@ -1,0 +1,20 @@
+{
+  "codes": {
+    "CHINNU-243A4H": {
+      "code": "CHINNU-243A4H",
+      "slots": 10,
+      "hours": 24,
+      "label": "Launch gift",
+      "active": true,
+      "limit": 0,
+      "used": 1,
+      "redeemed_by": [
+        "john"
+      ],
+      "multi": false,
+      "expires_at": 0,
+      "created": 1795596434,
+      "last_used": 1795596443
+    }
+  }
+}

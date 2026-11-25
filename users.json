@@ -1,0 +1,15 @@
+{
+  "users": {
+    "john": {
+      "username": "john",
+      "salt": "0869327a7ac489ea",
+      "password_hash": "cdb424fa8d3519f82b9ff1aa5bf7189207c6ed05af907b496680fa2760069597",
+      "slots": 10,
+      "telegram": "",
+      "created": 1795596437,
+      "is_admin": false,
+      "expires_at": 1795682843,
+      "updated": 1795596443
+    }
+  }
+}
