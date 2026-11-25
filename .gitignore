@@ -1,0 +1,15 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# runtime data — never commit real accounts
+data/
+*.log
+.env
+
+# os / editor junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
